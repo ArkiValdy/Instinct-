@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# data and trained artefacts, never committed
+data/*
+!data/*/.gitkeep
+models/*
+!models/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.pkl
+*.joblib
+
+# notebooks
+.ipynb_checkpoints/
+
+# os
+.DS_Store
