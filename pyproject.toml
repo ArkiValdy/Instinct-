@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# so tests can import from src/ and config/ when pytest runs at the project root
+pythonpath = ["."]
+testpaths = ["tests"]

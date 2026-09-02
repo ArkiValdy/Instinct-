@@ -1,19 +1,23 @@
 # secrets
 .env
 
-# data and trained artefacts, never committed
+# collected data and trained artefacts. never committed.
+# thumbnails run to gigabytes, and the YouTube API terms restrict
+# redistribution of collected data. share the dataset via Google Drive.
 data/*
+!data/*/
+data/*/*
 !data/*/.gitkeep
 models/*
 !models/.gitkeep
+*.pkl
+*.joblib
 
 # python
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
 venv/
-*.pkl
-*.joblib
 
 # notebooks
 .ipynb_checkpoints/

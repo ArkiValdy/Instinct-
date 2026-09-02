@@ -1,20 +1,31 @@
+# data
 pandas
 numpy
 requests
 python-dotenv
 google-api-python-client
+
+# modelling
 scikit-learn
 xgboost
 shap
+
+# title features
 spacy
 vaderSentiment
 sentence-transformers
+
+# thumbnail features
 opencv-python
 mediapipe
 pillow
 torch
 transformers
+
+# app
 streamlit
 plotly
 anthropic
+
+# testing
 pytest
