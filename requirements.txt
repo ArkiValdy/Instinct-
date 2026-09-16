@@ -4,6 +4,7 @@ numpy
 requests
 python-dotenv
 google-api-python-client
+pyarrow
 
 # modelling
 scikit-learn
