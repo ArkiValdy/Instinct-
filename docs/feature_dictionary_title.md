@@ -20,7 +20,7 @@ creator is choosing a title.
 | `has_number` | 0/1 | spaCy lexical | 0.30 |
 | `ends_with_question` | 0/1 | string | 0.008 |
 | `has_question` | 0/1 | string | 0.018 |
-| `has_brackets_or_pipe` | 0/1 | string | 0.49 |
+| `has_brackets_or_pipe` | 0/1 | string | 0.50 |
 | `emoji_count` | int | string (Unicode) | 0.21 |
 | `exclamation_count` | int | string | 0.29 |
 | `sentiment_compound` | float −1–1 | VADER | 0.23 |
