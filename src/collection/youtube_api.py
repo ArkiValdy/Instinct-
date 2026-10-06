@@ -25,6 +25,7 @@ Usage:
     python -m src.collection.youtube_api cooking --target 1500
     python -m src.collection.youtube_api cooking --target 1500 --budget 4000
     python -m src.collection.youtube_api cooking --fresh   # discard saved progress
+    python -m src.collection.youtube_api cooking --target 1500 --durations medium,long
     python -m src.collection.youtube_api cooking --refilter  # re-apply filters to saved rows
     python -m src.collection.youtube_api cooking --thumbnails-only
 
@@ -205,7 +206,7 @@ def paths_for(content_type):
     )
 
 
-def plan_tasks(queries, start, end):
+def plan_tasks(queries, start, end, durations=None):
     """Split the window into weekly slices and pair each with a query.
 
     Results are ordered by date, newest first, and a query stops paging at
@@ -216,6 +217,11 @@ def plan_tasks(queries, start, end):
     Ordered so the first len(slices) tasks visit every week once, with the
     query rotating, so a run that stops early is still spread across the
     window rather than concentrated at one end.
+
+    With durations (search.list videoDuration values: "medium" is 4-20
+    minutes, "long" over 20), each (query, week) is searched once per
+    duration, so Shorts never cost a search page. Each week gets all its
+    durations before the next week starts.
     """
     slices = []
     cursor = end
@@ -227,9 +233,27 @@ def plan_tasks(queries, start, end):
     for k in range(len(queries) * len(slices)):
         after, before = slices[k % len(slices)]
         query = queries[(k // len(slices) + k) % len(queries)]
-        tasks.append({"query": query, "after": to_rfc3339(after),
-                      "before": to_rfc3339(before)})
+        for duration in durations or [None]:
+            tasks.append({"query": query, "after": to_rfc3339(after),
+                          "before": to_rfc3339(before), "duration": duration})
     return tasks
+
+
+def replan(state, queries, durations, now):
+    """Replace the remaining tasks with a plan for new durations. Rows, seen
+    ids and the channel cache are kept, so nothing collected is fetched again.
+    The window is recalculated so new rows are 30-365 days old today."""
+    start = now - timedelta(days=MAX_DAYS_SINCE_PUBLISH)
+    end = now - timedelta(days=MIN_DAYS_SINCE_PUBLISH)
+    state.update({
+        "published_after": to_rfc3339(start),
+        "published_before": to_rfc3339(end),
+        "tasks": plan_tasks(queries, start, end, durations),
+        "durations": durations,
+        "task_index": 0,
+        "task_pages": 0,
+        "page_token": None,
+    })
 
 
 def new_state(content_type, queries, now):
@@ -304,6 +328,8 @@ def search_page(client, task, state):
         publishedBefore=task["before"],
         maxResults=BATCH,
     )
+    if task.get("duration"):
+        params["videoDuration"] = task["duration"]
     if state["page_token"]:
         params["pageToken"] = state["page_token"]
     payload = client.get("search", **params) or {}
@@ -438,7 +464,8 @@ def collect(client, state, rows, target, pages_per_task, table_path, state_path)
         state["units_total"] = state["units_run_start"] + client.units
         save(state, rows, table_path, state_path)
 
-        print(f"  [{task['query'][:18]:<18} wk {task['after'][:10]}] "
+        print(f"  [{task['query'][:18]:<18} wk {task['after'][:10]} "
+              f"{(task.get('duration') or 'any'):<6}] "
               f"page {state['pages_done']:>3}: "
               f"{len(ids):>2} ids, {len(new_ids):>2} new, {len(kept):>2} kept | "
               f"rows {len(rows):>5}/{target} | "
@@ -502,6 +529,10 @@ def main():
                         help="stop once this many rows survive the filters")
     parser.add_argument("--budget", type=int, default=QUOTA_BUDGET,
                         help="units this run may spend (daily cap is 10,000)")
+    parser.add_argument("--durations", type=lambda v: v.split(","), default=None,
+                        help="videoDuration values to search, e.g. medium,long. "
+                             "Differing from the saved plan replans the "
+                             "remaining tasks and keeps collected rows")
     parser.add_argument("--pages-per-task", type=int, default=PAGES_PER_TASK,
                         help="search pages per (query, week) before moving on")
     parser.add_argument("--no-thumbs", action="store_true",
@@ -531,6 +562,10 @@ def main():
     now = datetime.now(timezone.utc)
     state, rows = load(args.content_type, QUERIES[args.content_type], now, args.fresh)
     state["units_run_start"] = state["units_total"]
+    if args.durations and args.durations != state.get("durations"):
+        replan(state, QUERIES[args.content_type], args.durations, now)
+        print(f"Replanned for durations {args.durations}: "
+              f"{len(state['tasks'])} tasks, keeping {len(rows)} rows")
 
     if args.refilter:
         refilter(Client(key, budget=args.budget), state, table_path, state_path)
