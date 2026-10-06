@@ -25,6 +25,10 @@ Usage:
     python -m src.collection.youtube_api cooking --target 1500
     python -m src.collection.youtube_api cooking --target 1500 --budget 4000
     python -m src.collection.youtube_api cooking --fresh   # discard saved progress
+    python -m src.collection.youtube_api cooking --thumbnails-only
+
+Thumbnails go to data/thumbnails/ via simple_collect.download_thumbnails:
+plain HTTPS against i.ytimg.com, no quota. Already-present files are skipped.
 """
 
 import argparse
@@ -42,6 +46,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.collection.simple_collect import download_thumbnails  # noqa: E402
 from config.schema import (  # noqa: E402
     CHANNEL_ID,
     COLUMNS,
@@ -65,6 +70,8 @@ BATCH = 50  # the most ids videos.list and channels.list accept, and search's pa
 DAILY_QUOTA = 10_000
 QUOTA_BUDGET = 9_000  # headroom under the daily cap for manual exploration on the key
 MIN_DURATION_SECONDS = 60  # excludes Shorts, as in the collection spec
+SLICE_DAYS = 7  # width of each publish-date slice searched separately
+PAGES_PER_TASK = 1  # search pages per (query, slice); more concentrates on slice ends
 
 PROJECT = Path(__file__).resolve().parents[2]
 RAW = PROJECT / "data" / "raw"
@@ -125,8 +132,14 @@ class Client:
                     f"{endpoint} costs {cost}, which would pass the budget "
                     f"({self.units} of {self.budget} spent)"
                 )
-            response = self.session.get(url, params=params, timeout=30)
             self.units += cost
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+            except requests.RequestException as error:  # reset, timeout: retry
+                print(f"  ! {endpoint}: {type(error).__name__}, retrying",
+                      file=sys.stderr)
+                time.sleep(2 ** attempt)
+                continue
 
             if response.status_code == 200:
                 return response.json()
@@ -173,14 +186,46 @@ def paths_for(content_type):
     )
 
 
-def new_state(content_type, now):
-    """The window is fixed at the first run and reused on resume, because a
-    pageToken is only valid for the exact query parameters that produced it."""
+def plan_tasks(queries, start, end):
+    """Split the window into weekly slices and pair each with a query.
+
+    Results are ordered by date, newest first, and a query stops paging at
+    roughly 500 results. Over the whole window, a broad query would return
+    only the last few days before publishedBefore. Searching each week
+    separately spreads the sample across the window.
+
+    Ordered so the first len(slices) tasks visit every week once, with the
+    query rotating, so a run that stops early is still spread across the
+    window rather than concentrated at one end.
+    """
+    slices = []
+    cursor = end
+    while cursor > start:
+        slices.append((max(start, cursor - timedelta(days=SLICE_DAYS)), cursor))
+        cursor -= timedelta(days=SLICE_DAYS)
+
+    tasks = []
+    for k in range(len(queries) * len(slices)):
+        after, before = slices[k % len(slices)]
+        query = queries[(k // len(slices) + k) % len(queries)]
+        tasks.append({"query": query, "after": to_rfc3339(after),
+                      "before": to_rfc3339(before)})
+    return tasks
+
+
+def new_state(content_type, queries, now):
+    """The tasks, and so the window, are fixed at the first run and reused on
+    resume, because a pageToken is only valid for the exact query parameters
+    that produced it."""
+    start = now - timedelta(days=MAX_DAYS_SINCE_PUBLISH)
+    end = now - timedelta(days=MIN_DAYS_SINCE_PUBLISH)
     return {
         "content_type": content_type,
-        "published_after": to_rfc3339(now - timedelta(days=MAX_DAYS_SINCE_PUBLISH)),
-        "published_before": to_rfc3339(now - timedelta(days=MIN_DAYS_SINCE_PUBLISH)),
-        "query_index": 0,
+        "published_after": to_rfc3339(start),
+        "published_before": to_rfc3339(end),
+        "tasks": plan_tasks(queries, start, end),
+        "task_index": 0,
+        "task_pages": 0,
         "page_token": None,
         "pages_done": 0,
         "units_total": 0,
@@ -209,10 +254,10 @@ def save(state, rows, table_path, state_path):
     )
 
 
-def load(content_type, now, fresh):
+def load(content_type, queries, now, fresh):
     table_path, state_path = paths_for(content_type)
     if fresh or not state_path.exists():
-        return new_state(content_type, now), []
+        return new_state(content_type, queries, now), []
     state = json.loads(state_path.read_text(encoding="utf-8"))
     rows = []
     if table_path.exists():
@@ -222,15 +267,20 @@ def load(content_type, now, fresh):
 
 # --- API stages -------------------------------------------------------------
 
-def search_page(client, query, state):
-    """One search.list page: up to 50 video ids and the next pageToken."""
+def search_page(client, task, state):
+    """One search.list page: up to 50 video ids and the next pageToken.
+
+    order="date" rather than the default relevance ranking, which is itself a
+    function of engagement and would bias the sample towards the target.
+    """
     params = dict(
         part="id",
-        q=query,
+        q=task["query"],
         type="video",
+        order="date",
         relevanceLanguage="en",
-        publishedAfter=state["published_after"],
-        publishedBefore=state["published_before"],
+        publishedAfter=task["after"],
+        publishedBefore=task["before"],
         maxResults=BATCH,
     )
     if state["page_token"]:
@@ -330,14 +380,15 @@ def build_rows(items, state):
     return rows
 
 
-def collect(client, state, rows, queries, target, table_path, state_path):
-    """Page through the queries until `target` rows are kept, the queries run
-    out, or the budget is reached. Saves after every search page."""
+def collect(client, state, rows, target, pages_per_task, table_path, state_path):
+    """Work through the tasks until `target` rows are kept, the tasks run out,
+    or the budget is reached. Saves after every search page."""
     seen = set(state["seen_video_ids"])
+    tasks = state["tasks"]
 
-    while len(rows) < target and state["query_index"] < len(queries):
-        query = queries[state["query_index"]]
-        ids, next_token = search_page(client, query, state)
+    while len(rows) < target and state["task_index"] < len(tasks):
+        task = tasks[state["task_index"]]
+        ids, next_token = search_page(client, task, state)
 
         new_ids = [i for i in dict.fromkeys(ids) if i not in seen]
         items = fetch_videos(client, new_ids)
@@ -351,21 +402,37 @@ def collect(client, state, rows, queries, target, table_path, state_path):
         rows.extend(kept)
 
         state["pages_done"] += 1
-        if next_token:
+        state["task_pages"] += 1
+        if next_token and state["task_pages"] < pages_per_task:
             state["page_token"] = next_token
         else:
-            state["query_index"] += 1
+            state["task_index"] += 1
+            state["task_pages"] = 0
             state["page_token"] = None
         state["seen_video_ids"] = sorted(seen)
         state["units_total"] = state["units_run_start"] + client.units
         save(state, rows, table_path, state_path)
 
-        print(f"  [{query!r:<24}] page {state['pages_done']:>3}: "
+        print(f"  [{task['query'][:18]:<18} wk {task['after'][:10]}] "
+              f"page {state['pages_done']:>3}: "
               f"{len(ids):>2} ids, {len(new_ids):>2} new, {len(kept):>2} kept | "
               f"rows {len(rows):>5}/{target} | "
               f"quota {client.units:>5} this run, {state['units_total']:>6} total")
 
     return rows
+
+
+def thumbnails(table_path):
+    """Download thumbnails for every row. A failed download keeps its row with
+    an empty thumbnail_file, since the title model can still use it."""
+    rows = pd.read_parquet(table_path).to_dict("records")
+    print(f"\nDownloading thumbnails for {len(rows):,} rows")
+    got, failed, skipped = download_thumbnails(rows)
+    print(f"  {got} downloaded, {skipped} already present, {failed} failed")
+    write_atomic(
+        table_path,
+        lambda p: pd.DataFrame(rows, columns=COLUMNS).to_parquet(p, index=False),
+    )
 
 
 def main():
@@ -377,6 +444,12 @@ def main():
                         help="stop once this many rows survive the filters")
     parser.add_argument("--budget", type=int, default=QUOTA_BUDGET,
                         help="units this run may spend (daily cap is 10,000)")
+    parser.add_argument("--pages-per-task", type=int, default=PAGES_PER_TASK,
+                        help="search pages per (query, week) before moving on")
+    parser.add_argument("--no-thumbs", action="store_true",
+                        help="skip downloading thumbnails after collection")
+    parser.add_argument("--thumbnails-only", action="store_true",
+                        help="download thumbnails for the saved table, no API calls")
     parser.add_argument("--fresh", action="store_true",
                         help="ignore saved progress and start again")
     args = parser.parse_args()
@@ -384,22 +457,25 @@ def main():
     if args.content_type not in CONTENT_TYPES:
         print(f"  ! {args.content_type} is not in schema.CONTENT_TYPES")
 
+    table_path, state_path = paths_for(args.content_type)
+    if args.thumbnails_only:
+        thumbnails(table_path)
+        return
+
     load_dotenv(PROJECT / ".env")
     key = os.getenv("YOUTUBE_API_KEY")
     if not key:
         raise SystemExit("YOUTUBE_API_KEY is not set. Copy .env.example to .env.")
 
     RAW.mkdir(parents=True, exist_ok=True)
-    table_path, state_path = paths_for(args.content_type)
     now = datetime.now(timezone.utc)
-    state, rows = load(args.content_type, now, args.fresh)
+    state, rows = load(args.content_type, QUERIES[args.content_type], now, args.fresh)
     state["units_run_start"] = state["units_total"]
-    queries = QUERIES[args.content_type]
 
     resumed = state["pages_done"] > 0
     print(f"{'Resuming' if resumed else 'Starting'} {args.content_type}: "
           f"{len(rows)} rows, {state['pages_done']} pages done, "
-          f"query {state['query_index'] + 1} of {len(queries)}")
+          f"task {state['task_index'] + 1} of {len(state['tasks'])} (query x week)")
     print(f"Window (fixed at first run): {state['published_after']} to "
           f"{state['published_before']}")
     print(f"Budget this run: {args.budget} units. Each search page costs "
@@ -408,7 +484,7 @@ def main():
     client = Client(key, budget=args.budget)
     stopped = None
     try:
-        rows = collect(client, state, rows, queries, args.target,
+        rows = collect(client, state, rows, args.target, args.pages_per_task,
                        table_path, state_path)
     except QuotaExceeded as error:
         stopped = str(error)
@@ -426,8 +502,11 @@ def main():
         print(f"\nStopped: {stopped}. Progress is saved; rerun the same command "
               f"to resume. Quota resets at midnight Pacific.")
     elif len(rows) < args.target:
-        print(f"\nQueries exhausted before the target. Add queries to "
+        print(f"\nTasks exhausted before the target. Add queries to "
               f"QUERIES[{args.content_type!r}] and rerun to continue.")
+
+    if rows and not args.no_thumbs:
+        thumbnails(table_path)
 
 
 if __name__ == "__main__":
