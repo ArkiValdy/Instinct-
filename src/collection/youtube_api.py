@@ -25,6 +25,7 @@ Usage:
     python -m src.collection.youtube_api cooking --target 1500
     python -m src.collection.youtube_api cooking --target 1500 --budget 4000
     python -m src.collection.youtube_api cooking --fresh   # discard saved progress
+    python -m src.collection.youtube_api cooking --refilter  # re-apply filters to saved rows
     python -m src.collection.youtube_api cooking --thumbnails-only
 
 Thumbnails go to data/thumbnails/ via simple_collect.download_thumbnails:
@@ -37,6 +38,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -69,7 +71,14 @@ COST = {"search": 100, "videos": 1, "channels": 1}
 BATCH = 50  # the most ids videos.list and channels.list accept, and search's page size
 DAILY_QUOTA = 10_000
 QUOTA_BUDGET = 9_000  # headroom under the daily cap for manual exploration on the key
-MIN_DURATION_SECONDS = 60  # excludes Shorts, as in the collection spec
+# Shorts can run up to three minutes, so a 60 second cutoff lets most through.
+# This also drops genuine horizontal videos of three minutes or less, which is
+# the price of keeping the Shorts view distribution out of the target.
+SHORTS_MAX_SECONDS = 180
+# relevanceLanguage="en" is a ranking hint, not a filter. Titles where fewer
+# than this share of letters are Latin script are dropped. This catches Tamil,
+# Hindi, Thai and so on, but not romanised non-English text, which stays.
+MIN_LATIN_LETTER_SHARE = 0.8
 SLICE_DAYS = 7  # width of each publish-date slice searched separately
 PAGES_PER_TASK = 1  # search pages per (query, slice); more concentrates on slice ends
 
@@ -173,6 +182,16 @@ def parse_duration(value):
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
+def latin_share(title):
+    """Share of the title's letters that are Latin script. Emoji, digits and
+    punctuation are not letters, so they do not count either way."""
+    letters = [c for c in title if c.isalpha()]
+    if not letters:
+        return 1.0
+    latin = sum(1 for c in letters if unicodedata.name(c, "").startswith("LATIN"))
+    return latin / len(letters)
+
+
 def to_rfc3339(moment):
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -232,7 +251,8 @@ def new_state(content_type, queries, now):
         "seen_video_ids": [],
         "channels": {},  # channel id -> subscriber count, None if hidden or missing
         "dropped": {"low_subs": 0, "hidden_subs": 0, "no_views": 0, "short": 0,
-                    "bad_duration": 0, "live_or_upcoming": 0, "missing": 0},
+                    "bad_duration": 0, "live_or_upcoming": 0, "missing": 0,
+                    "non_latin": 0},
     }
 
 
@@ -259,6 +279,7 @@ def load(content_type, queries, now, fresh):
     if fresh or not state_path.exists():
         return new_state(content_type, queries, now), []
     state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["dropped"].setdefault("non_latin", 0)
     rows = []
     if table_path.exists():
         rows = pd.read_parquet(table_path).to_dict("records")
@@ -362,8 +383,12 @@ def build_rows(items, state):
         if seconds is None:
             dropped["bad_duration"] += 1
             continue
-        if seconds < MIN_DURATION_SECONDS:
+        if seconds <= SHORTS_MAX_SECONDS:
             dropped["short"] += 1
+            continue
+
+        if latin_share(snippet["title"]) < MIN_LATIN_LETTER_SHARE:
+            dropped["non_latin"] += 1
             continue
 
         video_id = item["id"]
@@ -422,6 +447,39 @@ def collect(client, state, rows, target, pages_per_task, table_path, state_path)
     return rows
 
 
+def refilter(client, state, table_path, state_path):
+    """Re-apply the duration and language filters to rows already collected.
+
+    Duration is not a schema column, so it is re-fetched: one videos.list call
+    per 50 rows. Used once, when the Shorts cutoff rose from 60s to 180s.
+    """
+    rows = pd.read_parquet(table_path).to_dict("records")
+    durations = {}
+    ids = [r[VIDEO_ID] for r in rows]
+    for start in range(0, len(ids), BATCH):
+        payload = client.get("videos", part="contentDetails",
+                             id=",".join(ids[start:start + BATCH])) or {}
+        for item in payload.get("items", []):
+            durations[item["id"]] = parse_duration(item["contentDetails"].get("duration"))
+
+    kept, dropped = [], state["dropped"]
+    for row in rows:
+        seconds = durations.get(row[VIDEO_ID])
+        if seconds is None:
+            dropped["bad_duration"] += 1  # removed since collection, or unparseable
+        elif seconds <= SHORTS_MAX_SECONDS:
+            dropped["short"] += 1
+        elif latin_share(row[TITLE]) < MIN_LATIN_LETTER_SHARE:
+            dropped["non_latin"] += 1
+        else:
+            kept.append(row)
+
+    state["units_total"] += client.units
+    save(state, kept, table_path, state_path)
+    print(f"Refiltered: {len(rows):,} -> {len(kept):,} rows, {client.units} units. "
+          f"Dropped so far: " + ", ".join(f"{k} {v}" for k, v in dropped.items() if v))
+
+
 def thumbnails(table_path):
     """Download thumbnails for every row. A failed download keeps its row with
     an empty thumbnail_file, since the title model can still use it."""
@@ -448,6 +506,8 @@ def main():
                         help="search pages per (query, week) before moving on")
     parser.add_argument("--no-thumbs", action="store_true",
                         help="skip downloading thumbnails after collection")
+    parser.add_argument("--refilter", action="store_true",
+                        help="re-apply duration and language filters to saved rows")
     parser.add_argument("--thumbnails-only", action="store_true",
                         help="download thumbnails for the saved table, no API calls")
     parser.add_argument("--fresh", action="store_true",
@@ -471,6 +531,10 @@ def main():
     now = datetime.now(timezone.utc)
     state, rows = load(args.content_type, QUERIES[args.content_type], now, args.fresh)
     state["units_run_start"] = state["units_total"]
+
+    if args.refilter:
+        refilter(Client(key, budget=args.budget), state, table_path, state_path)
+        return
 
     resumed = state["pages_done"] > 0
     print(f"{'Resuming' if resumed else 'Starting'} {args.content_type}: "
