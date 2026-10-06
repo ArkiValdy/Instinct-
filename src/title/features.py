@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import sys
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -63,7 +64,8 @@ FEATURES = [
     "has_superlative",
 ]
 
-BRACKETS_OR_PIPE = set("()[]{}|")
+# CJK brackets included: "【ENG DUB】" is a bracketed qualifier like "[ENG DUB]"
+BRACKETS_OR_PIPE = set("()[]{}|【】「」『』〔〕")
 SUPERLATIVE_TAGS = {"JJS", "RBS"}  # "best", "easiest"; "most"
 
 # One grapheme cluster is one emoji as a reader sees it, so a skin tone
@@ -73,6 +75,25 @@ SUPERLATIVE_TAGS = {"JJS", "RBS"}  # "best", "easiest"; "most"
 # pictographic but drawn as text, out of the count.
 GRAPHEME = regex.compile(r"\X")
 EMOJI = regex.compile(r"\p{Emoji_Presentation}|️")
+
+
+CURLY_QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+
+
+def vader_text(title):
+    """Clean a title for VADER, which matches words by splitting on whitespace
+    and stripping ASCII punctuation only.
+
+    Without this, "Better【" never matches "better" in the lexicon, and the
+    emoji variation selector U+FE0F hides the heart in "❤️" (scored 0, against
+    0.64 for a plain "❤"). Curly quotes become straight so "don’t" still reads
+    as a negation; any other non-ASCII punctuation becomes a space.
+    """
+    text = title.replace("️", "").translate(CURLY_QUOTES)
+    return "".join(
+        " " if not c.isascii() and unicodedata.category(c).startswith("P") else c
+        for c in text
+    )
 
 
 @lru_cache(maxsize=1)
@@ -128,7 +149,7 @@ def extract(titles):
     for title, doc in zip(titles, docs):
         row = string_features(title)
         row["has_number"] = int(any(token.like_num for token in doc))
-        row["sentiment_compound"] = vader.polarity_scores(title)["compound"]
+        row["sentiment_compound"] = vader.polarity_scores(vader_text(title))["compound"]
         row["has_superlative"] = int(
             any(token.tag_ in SUPERLATIVE_TAGS for token in doc)
         )

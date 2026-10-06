@@ -99,7 +99,8 @@ Worth It? | Taste Test"), which the feature above misses. Rare in cooking:
 
 ### `has_brackets_or_pipe`
 
-**Calculation:** 1 if the title contains any of `( ) [ ] { } |`.
+**Calculation:** 1 if the title contains any of `( ) [ ] { } |`, or the CJK
+brackets `【 】 「 」 『 』 〔 〕`, which serve the same purpose ("【ENG DUB】").
 
 **Why it might matter:** brackets and pipes mark the title as a main hook plus
 qualifiers or keywords ("Chicken Curry | Easy Weeknight Recipe"), a structure
@@ -125,9 +126,16 @@ than a flag, since "!!!" is a stronger signal than "!".
 
 ### `sentiment_compound`
 
-**Calculation:** VADER's compound score on the original title, from −1 (most
-negative) to +1 (most positive). VADER accounts for capitalisation, "!" and
-some emoji, which suits titles better than a model trained on long text.
+**Calculation:** VADER's compound score, from −1 (most negative) to +1 (most
+positive). VADER accounts for capitalisation, "!" and some emoji, which suits
+titles better than a model trained on long text.
+
+The title is cleaned for VADER first, because VADER matches words by splitting
+on whitespace and stripping ASCII punctuation only. The emoji variation
+selector (U+FE0F) is removed, since it hid the heart in "❤️" (scored 0, against
+0.64 for "❤"). Curly quotes become straight so "don’t" still negates. Other
+non-ASCII punctuation becomes a space, since "Better【" otherwise never
+matched "better". This changed the score of 8 of 595 cooking titles.
 
 **Why it might matter:** whether emotionally charged or positive titles reach
 further than neutral ones. **Limitation:** VADER translates emoji to words
