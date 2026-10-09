@@ -9,6 +9,11 @@ channel, the video's age or its view count enters the feature table, because
 those are either in the target (views, subscribers) or not known when a
 creator is choosing a title.
 
+Context features (video age, upload hour and weekday, duration, and
+subscribers as a labelled ablation) live in a separate table built by
+`src/title/context.py`. They are used in experiments and as controls only; see
+`docs/validation_protocol.md`.
+
 ## Summary
 
 | Column | Type | Source | Cooking mean (n=595) |

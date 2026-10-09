@@ -25,7 +25,8 @@ original, so the tagger sees lowercased text. Expect it to stay the noisiest
 feature.
 
 Usage:
-    python -m src.title.features cooking
+    python -m src.title.features cooking                  # search source
+    python -m src.title.features all --source seed        # seed source
 """
 
 import argparse
@@ -42,9 +43,9 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config.schema import TITLE, VIDEO_ID  # noqa: E402
+from src.title.target import ALL, SOURCES, load_dataset  # noqa: E402
 
 PROJECT = Path(__file__).resolve().parents[2]
-RAW = PROJECT / "data" / "raw"
 PROCESSED = PROJECT / "data" / "processed"
 
 SPACY_MODEL = "en_core_web_sm"
@@ -157,6 +158,14 @@ def extract(titles):
     return pd.DataFrame(rows, columns=FEATURES)
 
 
+def feature_path(content_type, source="search"):
+    """Where the feature table for a dataset lives. The search source has one
+    table per content type; the seed source has one table for all of them."""
+    if source == "seed":
+        return PROCESSED / "title_features_seed.parquet"
+    return PROCESSED / f"title_features_{content_type}.parquet"
+
+
 def build_feature_table(dataset):
     """The dataset in, one row per video out, keyed by video_id."""
     features = extract(dataset[TITLE].tolist())
@@ -168,14 +177,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("content_type")
+    parser.add_argument("--source", choices=SOURCES, default="search")
     args = parser.parse_args()
 
-    source = RAW / f"youtube_api_{args.content_type}.parquet"
-    dataset = pd.read_parquet(source)
-    table = build_feature_table(dataset)
+    content_type = ALL if args.source == "seed" else args.content_type
+    table = build_feature_table(load_dataset(content_type, args.source))
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
-    target = PROCESSED / f"title_features_{args.content_type}.parquet"
+    target = feature_path(args.content_type, args.source)
     table.to_parquet(target, index=False)
     print(f"{len(table):,} rows x {len(FEATURES)} features -> "
           f"{target.relative_to(PROJECT)}")

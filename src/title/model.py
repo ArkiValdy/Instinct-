@@ -45,14 +45,25 @@ import pandas as pd  # noqa: E402
 import shap  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 from sklearn.metrics import mean_absolute_error, r2_score  # noqa: E402
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit  # noqa: E402
+from sklearn.model_selection import (  # noqa: E402
+    GroupKFold,
+    GroupShuffleSplit,
+    RandomizedSearchCV,
+)
 from xgboost import XGBRegressor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from config.schema import CHANNEL_ID, VIDEO_ID  # noqa: E402
-from src.title.features import FEATURES  # noqa: E402
-from src.title.target import LOG_TARGET, RAW_TARGET, add_targets, load_dataset  # noqa: E402
+from config.schema import CHANNEL_ID, CONTENT_TYPE, VIDEO_ID  # noqa: E402
+from src.title.context import context_features  # noqa: E402
+from src.title.features import FEATURES, feature_path  # noqa: E402
+from src.title.target import (  # noqa: E402
+    CHANNEL_TARGET,
+    LOG_TARGET,
+    RAW_TARGET,
+    add_targets,
+    load_dataset,
+)
 
 PROJECT = Path(__file__).resolve().parents[2]
 PROCESSED = PROJECT / "data" / "processed"
@@ -60,6 +71,36 @@ PROCESSED = PROJECT / "data" / "processed"
 TEST_SIZE = 0.2
 N_FOLDS = 5
 SEED = 42
+
+# Defaults grow 100 trees of depth 6 with no minimum leaf weight, which fits
+# noise on a dataset this size: on cooking they scored worse than predicting
+# the mean in every fold. These are the opposite end: shallow trees, large
+# leaves, shrinkage, row and column subsampling and an L2 penalty, set by hand
+# before any tuning so they serve as a fixed reference point.
+REGULARISED = {
+    "n_estimators": 300,
+    "learning_rate": 0.03,
+    "max_depth": 2,
+    "min_child_weight": 20,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 10.0,
+}
+
+# Searched by tune(). Depth 1 is an additive model with no interactions, which
+# is a plausible answer for weak title signals, so it is in range.
+PARAM_SPACE = {
+    "n_estimators": [100, 200, 400, 800],
+    "learning_rate": [0.01, 0.03, 0.1],
+    "max_depth": [1, 2, 3, 4],
+    "min_child_weight": [1, 5, 20, 50],
+    "subsample": [0.6, 0.8, 1.0],
+    "colsample_bytree": [0.5, 0.8, 1.0],
+    "reg_lambda": [1.0, 10.0, 50.0],
+    "objective": ["reg:squarederror", "reg:absoluteerror"],
+}
+N_ITER = 30
+INNER_FOLDS = 3
 
 # chart tokens, as in target.py. SEQUENTIAL is the blue ramp from step 250,
 # the lightest step still visible on the surface, to step 700.
@@ -69,18 +110,19 @@ INK_MUTED = "#52514e"
 SEQUENTIAL = ["#86b6ef", "#3987e5", "#256abf", "#104281", "#0d366b"]
 
 
-def load_training_table(content_type):
-    """Features joined to targets and channel, one row per video."""
-    dataset = add_targets(load_dataset(content_type))
-    features = pd.read_parquet(PROCESSED / f"title_features_{content_type}.parquet")
+def load_training_table(content_type, source="search"):
+    """Title features, context features, targets, channel and content type,
+    one row per video."""
+    dataset = add_targets(load_dataset(content_type, source))
+    features = pd.read_parquet(feature_path(content_type, source))
     table = features.merge(
-        dataset[[VIDEO_ID, CHANNEL_ID, RAW_TARGET, LOG_TARGET]],
+        dataset[[VIDEO_ID, CHANNEL_ID, CONTENT_TYPE, RAW_TARGET, LOG_TARGET, CHANNEL_TARGET]],
         on=VIDEO_ID, how="inner", validate="one_to_one",
     )
     if len(table) != len(dataset):
         raise ValueError(f"{len(dataset) - len(table)} videos have no feature row; "
-                         f"rerun python -m src.title.features {content_type}")
-    return table
+                         f"rerun python -m src.title.features {content_type} --source {source}")
+    return table.merge(context_features(dataset), on=VIDEO_ID, validate="one_to_one")
 
 
 def channel_split(table):
@@ -92,9 +134,23 @@ def channel_split(table):
     return train_idx, test_idx
 
 
-def new_model():
-    """Library defaults: nothing is tuned yet."""
-    return XGBRegressor(random_state=SEED)
+def new_model(params=None):
+    """Library defaults unless params are given."""
+    return XGBRegressor(random_state=SEED, **(params or {}))
+
+
+def tune(X, y, groups):
+    """Hyperparameters chosen by random search, scored by MAE over grouped
+    folds of the data given, so no channel is in both halves of an inner
+    split either. Pass training rows only: tuning on the rows a model is
+    later scored on reports a score the model cannot reproduce."""
+    search = RandomizedSearchCV(
+        new_model({"n_jobs": 1}), PARAM_SPACE, n_iter=N_ITER,
+        scoring="neg_mean_absolute_error", cv=GroupKFold(n_splits=INNER_FOLDS),
+        random_state=SEED, n_jobs=-1,
+    )
+    search.fit(X, y, groups=groups)
+    return search.best_params_
 
 
 def score(y_true, y_pred):
