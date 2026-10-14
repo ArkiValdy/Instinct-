@@ -15,6 +15,8 @@ on public data collected through the YouTube Data API v3.
 git clone <repo-url>
 cd Instinct+
 
+brew install libomp                # macOS only, before pip. see below
+
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
@@ -25,6 +27,23 @@ cp .env.example .env               # then fill in your API keys
 ```
 
 `.env` is gitignored. Never commit it.
+
+**macOS: xgboost needs libomp.** The wheel links against the OpenMP runtime
+and does not bundle it, so without `brew install libomp` the install succeeds
+and the import fails at load time:
+
+```
+Library not loaded: @rpath/libomp.dylib
+  tried: '/opt/homebrew/opt/libomp/lib/libomp.dylib' (no such file)
+```
+
+Nothing in `requirements.txt` can fix this; it is a system library. Linux and
+Windows wheels bundle their own, so this step is Mac only.
+
+**matplotlib is a requirement, not an extra.** `src/title/target.py` and
+`src/title/model.py` import it at module scope to draw target distributions
+and the SHAP summary, so it is in `requirements.txt` rather than left to
+whatever shap happens to pull in.
 
 ### The dataset
 

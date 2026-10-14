@@ -43,7 +43,6 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config.schema import TITLE, VIDEO_ID  # noqa: E402
-from src.title.target import ALL, SOURCES, load_dataset  # noqa: E402
 
 PROJECT = Path(__file__).resolve().parents[2]
 PROCESSED = PROJECT / "data" / "processed"
@@ -174,6 +173,14 @@ def build_feature_table(dataset):
 
 
 def main():
+    # imported here rather than at module scope. Reading a collected dataset
+    # reaches src.collection, which calls load_dotenv and wants a YouTube
+    # key, and target imports matplotlib to draw its distributions. Building
+    # the training table needs all of that; scoring one typed title through
+    # extract needs none of it, and the app should not have to install or
+    # configure it to call the same function.
+    from src.title.target import ALL, SOURCES, load_dataset
+
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("content_type")
