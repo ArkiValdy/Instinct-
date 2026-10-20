@@ -1,0 +1,10 @@
+{
+  "description": "Generate engaging video thumbnails with titles and genres while receiving a clickbait score and feedback to enhance viewer attraction.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
